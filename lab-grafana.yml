@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Application CloudFormation Template.
+  Provisions an EC2 instance in the VPC created by the network stack,
+  with User Data to deploy Grafana on minikube (Kubernetes).
+
+# Creates one EC2 (Amazon Linux 2023, t2.medium), a security group
+# opening 22/3000/8081, and uses the "vockey" key pair.
+#
+# Pulled bits from a few labs:
+#   - Cloudformation shell (parameters / resources / outputs, cross-stack imports)
+#     from the ACA M11 application stack, with WebServer* renamed Grafana*.
+#   - EC2 config (vockey, port 3000, Amazon Linux 2023) from the
+#     Grafana-on-EC2 lab plus the 2026 coursework brief.
+#   - Docker / minikube / dashboard / port-forwards from the Virtual
+#     Servers and Containers lab.
+#   - tee-heredoc UserData pattern is the one the brief asks for (p.5).
+#
+# Research bits :
+#   - GF_INSTALL_PLUGINS on the Grafana Deployment, so the Google Sheets
+#     plugin auto-installs at pod startup - no manual plugin step.
+#   - setup-grafana.py calls the Grafana HTTP API to create the datasource
+#     and Heat Pump dashboard. Python stdlib only, no pip needed.
+#
+# Things we had to change from the lab instructions:
+#   - t2.medium, not t2.micro. Minikube wants 4GB; 1GB isn't enough.
+#   - "su - ec2-user -c" instead of the brief's "su - -c" - minikube
+#     won't run under root ("The 'docker' driver should not be used
+#     with root privileges").
+#   - "sg docker -c '...'" instead of "newgrp docker" - newgrp opens an
+#     interactive shell and hangs cloud-init forever.
+
+Parameters:
+
+  NetworkStackName:
+    Description: Name of the network stack whose VPC and subnet this stack will use.
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: '^[a-zA-Z][-a-zA-Z0-9]*$'
+    Default: lab-network
+
+  # Same SSM lookup M11 lab uses, just pointed at Amazon Linux 2023 instead
+  # of Amazon Linux 2 (the brief wants the latest).
+  AmazonLinuxAMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+
+  # t2.medium because minikube needs 4GB. Removed M11's CFN::Init block,
+  # CreationPolicy signal, and the extra EBS volume - none of them are
+  # used here.
+  GrafanaInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.medium
+      ImageId: !Ref AmazonLinuxAMIID
+      KeyName: vockey
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref GrafanaSecurityGroup
+          AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          DeleteOnTermination: true
+          SubnetId:
+            Fn::ImportValue:
+              !Sub ${NetworkStackName}-SubnetID
+      Tags:
+        - Key: Name
+          Value: Grafana Server
+      # UserData writes four files to /tmp (kubernetes manifests, GCP service
+      # account key, the Python automation, and the install script),
+      # then runs the install script.
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # --- /tmp/grafana.yml: Kubernetes manifests ---
+          # Mostly the grafana.yml from the project files. The only real
+          # change is the GF_INSTALL_PLUGINS env var below, which pulls
+          # the Google Sheets plugin in automatically.
+          tee /tmp/grafana.yml <<'EOF'
+          # Deploy grafana.yml to minikube, then forward port 3000 externally
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: grafana-pvc
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            labels:
+              app: grafana
+            name: grafana
+          spec:
+            selector:
+              matchLabels:
+                app: grafana
+            template:
+              metadata:
+                labels:
+                  app: grafana
+              spec:
+                securityContext:
+                  fsGroup: 472
+                  supplementalGroups:
+                    - 0
+                containers:
+                  - name: grafana
+                    image: grafana/grafana:latest
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - containerPort: 3000
+                    env:
+                      # Auto-installs the Google Sheets plugin on pod
+                      # start, so no manual plugin step.
+                      - name: GF_INSTALL_PLUGINS
+                        value: grafana-googlesheets-datasource
+                    readinessProbe:
+                      failureThreshold: 3
+                      httpGet:
+                        path: /robots.txt
+                        port: 3000
+                        scheme: HTTP
+                      initialDelaySeconds: 10
+                      periodSeconds: 30
+                      successThreshold: 1
+                      timeoutSeconds: 2
+                    livenessProbe:
+                      failureThreshold: 3
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      successThreshold: 1
+                      tcpSocket:
+                        port: 3000
+                      timeoutSeconds: 1
+                    resources:
+                      requests:
+                        cpu: 250m
+                        memory: 750Mi
+                    volumeMounts:
+                      - mountPath: /var/lib/grafana
+                        name: grafana-pv
+                volumes:
+                  - name: grafana-pv
+                    persistentVolumeClaim:
+                      claimName: grafana-pvc
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: grafana
+          spec:
+            ports:
+              - port: 3000
+                targetPort: 3000
+            selector:
+              app: grafana
+            type: NodePort
+          EOF
+
+          # --- /tmp/jwt.json: GCP service-account key ---
+          # From the project files. setup-grafana.py reads this to
+          # authenticate against the Google Sheet with the Heat Pump data.
+          # Heredoc tag is single-quoted (<<'JWTEOF') so bash doesn't try
+          # to expand the $ signs inside the PEM key, that would corrupt it.
+          tee /tmp/jwt.json <<'JWTEOF'
+          {
+            "type": "service_account",
+            "project_id": "turnkey-lacing-476817-u3",
+            "private_key_id": "REDACTED",
+            "private_key": "REDACTED",
+            "client_email": "comm065-2026-assignment@turnkey-lacing-476817-u3.iam.gserviceaccount.com",
+            "client_id": "118056501059471189208",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/comm065-2026-assignment%40turnkey-lacing-476817-u3.iam.gserviceaccount.com",
+            "universe_domain": "googleapis.com"
+          }
+          JWTEOF
+
+          # --- /tmp/setup-grafana.py: Grafana API automation ---
+          # Research component. Calls the Grafana HTTP API to create the
+          # Google Sheets datasource and Heat Pump dashboard, replacing
+          # the manual UI clicks. Python stdlib only, no pip needed.
+          tee /tmp/setup-grafana.py <<'PYEOF'
+          #!/usr/bin/env python3
+          
+          import json
+          import urllib.request
+          import base64
+          import time
+          import sys
+
+          GRAFANA_URL = "http://localhost:3000"
+          GRAFANA_USER = "admin"
+          GRAFANA_PASS = "admin"
+
+          # Helper used by all three functions below to send authenticated
+          # HTTP requests to Grafana. Handles JSON encoding and basic auth.
+          def grafana_request(path, data=None, method="GET"):
+              """Making an authenticated request to the Grafana HTTP API."""
+              url = f"{GRAFANA_URL}{path}"
+              headers = {
+                  "Content-Type": "application/json",
+                  "Authorization": "Basic " + base64.b64encode(
+                      f"{GRAFANA_USER}:{GRAFANA_PASS}".encode()
+                  ).decode()
+              }
+              body = json.dumps(data).encode() if data else None
+              req = urllib.request.Request(url, data=body, headers=headers, method=method)
+              try:
+                  resp = urllib.request.urlopen(req)
+                  return json.loads(resp.read().decode())
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP Error {e.code}: {e.read().decode()}")
+                  return None
+
+          # Waits for Grafana to finish starting up before we try to use the
+          # API. Retries every 10 seconds for up to 5 minutes.
+          def wait_for_grafana(max_retries=30, delay=10):
+              """Polling /api/health until Grafana responds or retries run out."""
+              for i in range(max_retries):
+                  try:
+                      req = urllib.request.Request(f"{GRAFANA_URL}/api/health")
+                      resp = urllib.request.urlopen(req, timeout=5)
+                      if resp.status == 200:
+                          print(f"Grafana is ready (attempt {i+1})")
+                          return True
+                  except Exception:
+                      pass
+                  print(f"Waiting for Grafana... (attempt {i+1}/{max_retries})")
+                  time.sleep(delay)
+              print("ERROR: Retries exhausted, Grafana never responded on /api/health.")
+              return False
+
+          # Registers the Google Sheets datasource in Grafana using the JWT
+          # credentials from jwt.json. Returns the datasource UID, which the
+          # dashboard function needs to wire up its panel.
+          def create_datasource(jwt_data):
+              """Creating Google Sheets datasource using JWT authentication."""
+              datasource = {
+                  "name": "Google Sheets",
+                  "type": "grafana-googlesheets-datasource",
+                  "access": "proxy",
+                  "jsonData": {
+                      "authenticationType": "jwt",
+                      "defaultProject": jwt_data["project_id"],
+                      "clientEmail": jwt_data["client_email"],
+                      "tokenUri": jwt_data["token_uri"]
+                  },
+                  "secureJsonData": {
+                      "privateKey": jwt_data["private_key"]
+                  }
+              }
+              result = grafana_request("/api/datasources", data=datasource, method="POST")
+              if result:
+                  ds_uid = result.get("datasource", {}).get("uid", "")
+                  print(f"Datasource created successfully. UID: {ds_uid}")
+                  return ds_uid
+              else:
+                  print("ERROR: Failed to create datasource")
+                  return None
+
+          # Creates the Heat Pump timeseries dashboard and points it at the
+          # Google Sheet. The ds_uid ties the panel to the datasource above.
+          def create_heat_pump_dashboard(ds_uid):
+              """Creating Heat Pump dashboard using the Grafana HTTP API."""
+              dashboard = {
+                  "dashboard": {
+                      "title": "Lab dashboard - Heat Pump",
+                      "timezone": "",
+                      "time": {"from": "2026-01-01T00:00:00.000Z", "to": "2026-01-02T00:00:00.000Z"},
+                      "panels": [
+                          {
+                              "id": 1,
+                              "title": "Heat Pump",
+                              "type": "timeseries",
+                              "gridPos": {"h": 16, "w": 24, "x": 0, "y": 0},
+                              "datasource": {
+                                  "type": "grafana-googlesheets-datasource",
+                                  "uid": ds_uid
+                              },
+                              "targets": [
+                                  {
+                                      "datasource": {
+                                          "type": "grafana-googlesheets-datasource",
+                                          "uid": ds_uid
+                                      },
+                                      "spreadsheet": "1pKMm0kKgCINLCJvoL7TgkLZGGb_xdtP5VCbJwmiesS8",
+                                      "range": "",
+                                      "cacheDurationSeconds": 300,
+                                      "refId": "A"
+                                  }
+                              ],
+                              "fieldConfig": {
+                                  "defaults": {
+                                      "unit": "celsius",
+                                      "custom": {
+                                          "lineWidth": 2,
+                                          "pointSize": 1,
+                                          "drawStyle": "line",
+                                          "lineInterpolation": "linear",
+                                          "showPoints": "auto"
+                                      }
+                                  },
+                                  "overrides": []
+                              },
+                              "options": {
+                                  "tooltip": {"mode": "single"},
+                                  "legend": {"displayMode": "list", "placement": "bottom"}
+                              }
+                          }
+                      ],
+                      "schemaVersion": 39,
+                      "version": 0
+                  },
+                  "overwrite": True
+              }
+              result = grafana_request("/api/dashboards/db", data=dashboard, method="POST")
+              if result:
+                  print(f"Dashboard created successfully: {result.get('url', '')}")
+              else:
+                  print("ERROR: Failed to create dashboard")
+
+          if __name__ == "__main__":
+              print("=" * 60)
+              print("Grafana Google Sheets Automation")
+              print("=" * 60)
+
+              # Wait for Grafana to be ready
+              if not wait_for_grafana():
+                  sys.exit(1)
+
+              # Read JWT credentials
+              print("Reading JWT credentials from /tmp/jwt.json...")
+              with open("/tmp/jwt.json") as f:
+                  jwt_data = json.load(f)
+
+              # Create datasource
+              print("Creating Google Sheets datasource...")
+              ds_uid = create_datasource(jwt_data)
+              if not ds_uid:
+                  sys.exit(1)
+
+              # Brief pause for datasource to initialise
+              time.sleep(5)
+
+              # Create Heat Pump dashboard
+              print("Creating Heat Pump dashboard...")
+              create_heat_pump_dashboard(ds_uid)
+
+              print("=" * 60)
+              print("Google Sheets automation complete!")
+              print("=" * 60)
+          PYEOF
+
+          # --- /tmp/grafanainstall.sh: install orchestration ---
+          # Docker, minikube, kubectl apply, dashboard + metrics addons,
+          # port-forwards, then the Python bootstrapper at the end.
+          tee /tmp/grafanainstall.sh <<'EOF'
+          #!/bin/bash
+
+          sudo yum update -y
+
+          sudo yum install docker -y
+          sudo usermod -a -G docker ec2-user
+          sudo systemctl enable docker.service
+          sudo systemctl start docker.service
+
+          # sg docker -c '...' runs the block with the docker group
+          # active without opening an interactive shell. "newgrp docker"
+          # would be the obvious choice but it hangs cloud-init forever.
+          sg docker -c '
+          curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-latest.x86_64.rpm
+          sudo rpm -Uvh minikube-latest.x86_64.rpm
+          minikube start --driver=docker --memory=3000mb
+
+          sleep 30
+
+          minikube kubectl -- apply -f /tmp/grafana.yml
+
+          minikube addons enable dashboard
+          minikube addons enable metrics-server
+
+          # Give the pods a minute to come up before the port-forwards.
+          sleep 60
+
+          minikube kubectl -- port-forward -n kubernetes-dashboard service/kubernetes-dashboard 8081:80 --address 0.0.0.0 &
+          minikube kubectl -- port-forward --address 0.0.0.0 service/grafana 3000:3000 &
+
+          # The bootstrapper polls /api/health itself, so it is fine to
+          # fire this while the port-forwards are still warming up.
+          python3 /tmp/setup-grafana.py
+          '
+          EOF
+
+          # Run the installer as ec2-user, not root. Minikube refuses to
+          # use the docker driver under root ("The 'docker' driver should
+          # not be used with root privileges").
+          su - ec2-user -c "/bin/bash /tmp/grafanainstall.sh"
+
+  # M11's SG only opened port 80. We need 22 for SSH, 3000 for the
+  # Grafana UI, and 8081 for the Kubernetes dashboard.
+  GrafanaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH, Grafana, and Kubernetes dashboard access
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${NetworkStackName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Grafana Security Group
+
+# URL is M11's output with port 80 swapped for 3000.
+
+Outputs:
+  URL:
+    Description: Public URL for the Grafana server
+    Value: !Sub 'http://${GrafanaInstance.PublicDnsName}:3000'
+
+  PublicIP:
+    Description: Public IP address of the Grafana EC2 instance
+    Value: !GetAtt GrafanaInstance.PublicIp

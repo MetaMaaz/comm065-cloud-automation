@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Network CloudFormation Template.
+  Provisions a VPC, subnet, and internet gateway for the Grafana deployment stack.
+
+# Pulled bits from ACA M11 "Automating Infrastructure with AWS
+# CloudFormation" network template. Changes vs M11:
+#   - Name tags renamed from "Web Server *" to "Grafana *" so they match
+#     the application stack.
+#   - Description updated.
+#   - Outputs exports (${AWS::StackName}-SubnetID and -VPCID) kept as-is
+#     so lab-grafana.yml can Fn::ImportValue them.
+
+Resources:
+
+  # CidrBlock 10.0.0.0/16 is the M11 default. DNS is on so the EC2 can
+  # resolve yum / Docker / minikube download URLs.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: Grafana VPC
+
+  # Needed so cloud-init can reach the internet to pull Docker, minikube,
+  # and the Grafana container image during boot.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Grafana Internet Gateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Grafana Public Route Table
+
+  # Default route 0.0.0.0/0 through the IGW - makes the subnet public.
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # One public subnet in the first AZ. Minikube runs on a single EC2, so
+  # multi-AZ is overkill for this coursework.
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      Tags:
+        - Key: Name
+          Value: Grafana Public Subnet
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetNetworkAclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      NetworkAclId: !GetAtt
+        - VPC
+        - DefaultNetworkAcl
+
+# These exports are the whole reason for having a separate network stack -
+# lab-grafana.yml pulls them in via Fn::ImportValue.
+# NOTE: this stack must be named exactly "lab-network", since the app stack
+# hardcodes that prefix (e.g. !ImportValue lab-network-SubnetID).
+Outputs:
+
+  PublicSubnet:
+    Description: The subnet ID for the Grafana EC2 server
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetID'
+
+  VPC:
+    Description: VPC ID for the Grafana network
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
